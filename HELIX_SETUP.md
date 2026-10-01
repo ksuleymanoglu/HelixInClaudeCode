@@ -19,25 +19,17 @@ reviewer agents check the new code" and the loop repeats "until both reviewers a
 and where "a subagent reads the reference code and generates test cases for each
 checkpoint" that define what "proven" means.
 
-This guide sets Helix up in three agents: **Claude Code** (the reference implementation),
-**OpenAI Codex CLI**, and **Google Antigravity**. All three expose the two capabilities
-Helix depends on — a pre-tool hook that can block a call, and a stop hook that can refuse
-to let the agent finish — so the workflow ports to each with the same guarantees.
+This guide sets Helix up in Claude Code (the reference implementation).
+Claude Code has the two capabilities Helix depends on: a pre-tool hook that can
+block a call, and a stop hook that can refuse to let the agent finish.
 
 > Credit: **Helix** is the name of an agent-driven migration system published by Shopify
 > Engineering, used to migrate their mobile app from React Native to native Swift and
 > Kotlin. Its published design — breaking work into checkpoints of increasing complexity,
 > using independent context-isolated reviewer agents, and enforcing gates the agent
-> "can't override" — is the pattern this guide implements for general coding tasks on
-> other agents. This guide is an independent implementation, not affiliated with or
+> "can't override" — is the pattern this guide implements for general coding tasks in Claude Code.
+> This guide is an independent implementation, not affiliated with or
 > endorsed by Shopify. See <https://shopify.engineering/helix>.
-
-> Provenance note: the Claude Code section describes the working implementation in this
-> repository (directly observed). The Codex and Antigravity sections are adaptations
-> built from those vendors' official documentation; every external capability claim is
-> cited at the end with a confidence label. The example hook config files for Codex and
-> Antigravity are **illustrative skeletons** — match them to the exact schema in each
-> vendor's current docs before relying on them.
 
 ---
 
@@ -66,7 +58,7 @@ enforces exactly that separation of roles.
 
 ---
 
-## Part 1 — Claude Code (reference implementation)
+## Claude Code (reference implementation)
 
 ### File layout
 
@@ -77,7 +69,6 @@ enforces exactly that separation of roles.
   agents/test-author.md          # subagent: generates a checkpoint's tests from its criteria
   agents/reviewer-a.md           # subagent: independent reviewer A (own verdict + critique-a.md)
   agents/reviewer-b.md           # subagent: independent reviewer B (own verdict + critique-b.md)
-  agents/critic.md               # DEPRECATED single reviewer (kept as a pointer; no longer trusted)
   hooks/helix-guard.js           # PreToolUse hook (the guard)
   hooks/helix-stop.js            # Stop hook (the stop-gate)
   settings.json                  # registers the two hooks
@@ -213,8 +204,8 @@ re-reviews. Repeat until every checkpoint is approved by both reviewers.
 /orchestrator build an interactive tutor that teaches AI agent evaluations
 ```
 
-Approve the plan, then let the loop run. The stop-gate keeps the agent working until the
-critic has approved every checkpoint.
+Approve the plan, then let the loop run. The stop-gate keeps the agent working until
+both reviewers have approved every checkpoint.
 
 ## Sources & confidence
 
@@ -225,7 +216,5 @@ read directly (not from search summaries), on 2026-09-30.
 - Claude Code hooks — a `PreToolUse` hook on exit code 2 "Blocks the tool call"; a `Stop` hook on exit code 2 "Prevents Claude from stopping, continues the conversation": <https://code.claude.com/docs/en/hooks>
 - Claude Code subagents — "each subagent runs in its own context window"; project `.claude/agents/`, user `~/.claude/agents/`: <https://code.claude.com/docs/en/sub-agents>
 - Claude Code skills — a `SKILL.md` creates a matching slash command: <https://code.claude.com/docs/en/slash-commands>
-- OpenAI Codex hooks — `PreToolUse` deny (or exit 2); `Stop` `decision: "block"` "tells Codex to continue"; `hooks.json` / `config.toml` locations; subagent events: <https://developers.openai.com/codex/hooks>
-- Google Antigravity hooks — `PreToolUse` `deny` "Hard blocks execution immediately"; `Stop` `decision: "continue"` "to prevent the agent from stopping and re-enter the execution loop"; `.agents/hooks.json` location: <https://antigravity.google/docs/hooks/>
 
 Helix is the name of Shopify Engineering's published agent-driven migration system. What this guide provides is an independent, general-purpose implementation of that pattern on Claude Code primitives — not Shopify's tool itself, and not affiliated with or endorsed by Shopify.
