@@ -53,8 +53,6 @@ Every fix came with a new test for that exact failure. That's much of how the su
 - **Keep the reviewers apart.** On checkpoint 1, one reviewer approved while the other found a test file that ran on Python 3.12 but broke on 3.10, the version the README promised to support. On checkpoint 3, the roles flipped. Either reviewer working alone would have let one of those through.
 - **Budget for it.** It takes more time and more tokens.
 
-I still let agents run freely when I'm exploring. Helix is what I add when I get serious about a project.
+I still let agents run freely when I'm exploring. Helix is what I use when I get serious about a project.
 
----
 
-All figures come from a single run on one project.
