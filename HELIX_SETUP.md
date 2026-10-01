@@ -152,12 +152,12 @@ The **guard** (`PreToolUse` event) — enforced per role (the subagent's name; "
 Claude Code supports both of these because, in its hooks reference, a `PreToolUse` hook
 that returns exit code 2 (or a JSON `permissionDecision` of `deny`) **"Blocks the tool
 call"**, and a `Stop` hook that returns exit code 2 **"Prevents Claude from stopping,
-continues the conversation."** [VERIFIED — see Sources]
+continues the conversation."** 
 
 ### The subagents
 
 A subagent is a Markdown file with YAML frontmatter followed by a system prompt, and
-"each subagent runs in its own context window." [VERIFIED] Helix uses four:
+each subagent runs in its own context window. Helix uses four:
 
 - **`planner`** — turns the request into checkpoints (each with a `test_target` and two
   `pending` reviewer slots).
