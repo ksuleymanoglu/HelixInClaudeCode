@@ -176,7 +176,7 @@ that. The full system prompt of every subagent is in [Complete files](#complete-
 ### The orchestrator skill
 
 A skill is a `SKILL.md` file that becomes a slash command; a skill at
-`.claude/skills/orchestrator/SKILL.md` creates `/orchestrator`. [VERIFIED] Its body is
+`.claude/skills/orchestrator/SKILL.md` creates `/orchestrator`. Its body is
 the workflow: delegate to the planner, present the plan for approval, then loop over
 checkpoints — for the first unapproved one, delegate to the **test-author** to generate
 its tests, implement it, run the tests yourself, then delegate to **reviewer-a and
