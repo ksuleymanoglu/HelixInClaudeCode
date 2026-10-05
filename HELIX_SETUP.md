@@ -12,6 +12,11 @@ rather than advisory:
 - a **stop-gate** that refuses to let the agent end its turn while any checkpoint is
   still unapproved.
 
+Both hooks also enforce a **budget** so a run cannot loop forever: a limit on review rounds
+per checkpoint and per run, a limit on active time per checkpoint and per run, and a
+**diff alarm** when the code changed grows past a set size. When any part of the budget is
+spent, the run **halts** and goes back to you; the agent cannot raise its own limits.
+
 A checkpoint's `passed` flag is never written by a tool call at all: the stop-gate
 **derives** it from the two reviewers' verdicts and flips it to `true` only when _both_
 have approved **and those approvals still describe the code**: each approval records the
@@ -42,14 +47,15 @@ block a call, and a stop hook that can refuse to let the agent finish.
 | A reusable command       | The `orchestrator` that drives plan → approve → test → implement → review loop                           | Entry point the user invokes                                                                                                                      |
 | Subagents                | The `planner`, the `test-author`, and two reviewers `reviewer-a` / `reviewer-b`, each in its own context | Separation of duties: the builder cannot be the approver, and two independent reviewers must agree                                                |
 | A blocking pre-tool hook | The `guard`                                                                                              | Confines each role: the builder can't approve or edit findings; each reviewer writes only its own verdict/file, and only for the code on disk; the test-author writes only tests |
-| A blocking stop hook     | The `stop-gate`                                                                                          | Forces the loop to continue until every checkpoint is approved by both reviewers and every approval still matches the code                        |
+| A blocking stop hook     | The `stop-gate`                                                                                          | Forces the loop to continue until every checkpoint is approved by both reviewers and every approval still matches the code, and halts it when the budget is spent |
 
 The state of a run lives, per project, in the state file plus one findings file per reviewer:
 
 ```
-.claude/helix/state.json     # the plan: checkpoints, acceptance criteria, per-reviewer verdicts with their files and hash, passed flags, status, recheck mode
+.claude/helix/state.json     # the plan: checkpoints, acceptance criteria, per-reviewer verdicts with their files and hash, passed flags, status, recheck mode, limits
 .claude/helix/critique-a.md  # reviewer-a's latest findings or approval
 .claude/helix/critique-b.md  # reviewer-b's latest findings or approval
+.claude/helix/ledger.jsonl   # usage against the budget; written only by the hooks
 ```
 
 No agent writes a checkpoint's `passed` flag. Each reviewer records only its own verdict
@@ -116,6 +122,75 @@ when you approve the plan (`/orchestrator approve deferred`); without either, it
 still edit the field by hand. With `"strict"` on a plan where one file runs through every
 checkpoint, consider raising `max_iterations`.
 
+### The budget: pass limits, time limits, and the diff alarm
+
+Two independent reviewers who must both approve, approvals that go stale when code changes,
+and rechecks of earlier checkpoints can between them keep a run going for a long time: a
+fix for one reviewer draws a new finding from the other, or a fix in one checkpoint makes
+another stale, and so on. Without a budget, the only thing stopping such a run is you.
+
+Every plan therefore carries a `limits` object, which the planner writes and you can edit
+before approving:
+
+```json
+"max_iterations": 25,
+"limits": {
+  "max_review_rounds": 4,
+  "max_total_review_rounds": null,
+  "max_active_minutes": 240,
+  "max_checkpoint_minutes": 60,
+  "max_diff_lines": null,
+  "max_checkpoint_diff_lines": 800
+}
+```
+
+| Limit                       | What it caps                                                                                              | Default                          |
+| --------------------------- | --------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `max_review_rounds`         | Review rounds on one checkpoint, re-reviews (`RECHECK:`) included. A round is one verdict from each reviewer. | 4                              |
+| `max_total_review_rounds`   | Review rounds in the whole run                                                                             | 3 per checkpoint (at least 6)    |
+| `max_active_minutes`        | Active time for the whole run                                                                              | 240                              |
+| `max_checkpoint_minutes`    | Active time on the checkpoint currently being built or re-reviewed                                         | 60                               |
+| `max_diff_lines`            | **Diff alarm:** lines changed since the run started                                                        | 500 per checkpoint (at least 1000) |
+| `max_checkpoint_diff_lines` | **Diff alarm:** how much the diff grew while the current checkpoint was being worked on                    | 800                              |
+| `max_iterations` (top level) | Blocked stops in the whole run                                                                            | 25                               |
+
+A `null` limit uses the default sized from the number of checkpoints.
+
+How usage is measured:
+
+- **Review rounds** are counted by the guard each time a reviewer records a verdict.
+- **Active time** is measured from hook activity: the hooks record a tick at most once a
+  minute while the run is `in_progress` or `paused`. A gap of more than 10 minutes with no
+  tool activity counts as idle (a run waiting on you overnight) and is not counted.
+- **Diff size** is lines added plus lines deleted against the commit the run started on
+  (`git diff --numstat`), plus the lines of new untracked files, excluding `.claude/`. The
+  checkpoint figure is the growth since that checkpoint became the current one. Outside a
+  git repository the diff alarm is off.
+- **Blocked stops** are counted for the whole run. Pausing does not reset the count.
+
+Usage lives in `.claude/helix/ledger.jsonl`, an append-only log that only the hooks write.
+A new plan from the planner starts a new ledger (the previous one is kept as
+`ledger.prev.jsonl`). To see usage against the limits at any time, run from the project
+root:
+
+```
+node ~/.claude/hooks/helix-budget.js
+```
+
+When any limit is spent:
+
+1. The guard refuses to delegate to the test-author or either reviewer, and refuses to set
+   the run back to `in_progress`. A reviewer already working may still record its verdict.
+2. The stop-gate sets `status` to `"halted"`, records why in `halt_reason`, and lets the
+   agent stop, with a message that says which limit was spent.
+3. The orchestrator reports to you: the limit, the usage, which checkpoints passed, and the
+   open findings on the one that did not.
+
+Only you can resume a halted run. The guard denies any change to `limits` from the agent,
+and it denies moving a halted run out of `halted` while the budget is still spent. To
+continue, raise the spent limit (or `max_iterations`) in `state.json` by hand and run
+`/orchestrator`. Or re-plan with narrower checkpoints, or stop and keep what passed.
+
 ### Single-concern modules keep reviews cheap
 
 Because an approval goes stale when _any_ of its files changes, the cost of rechecking
@@ -144,10 +219,12 @@ is still caught by the hash, it just costs an extra review.
   hooks/helix-guard.js           # PreToolUse hook (the guard)
   hooks/helix-stop.js            # Stop hook (the stop-gate)
   hooks/helix-hash.js            # shared approval hash: used by both hooks and run by the reviewers
+  hooks/helix-budget.js          # shared budget: limits, usage ledger, diff alarm (used by both hooks)
   settings.json                  # registers the two hooks
   helix/state.json               # per-run plan + status (created when a run starts)
   helix/critique-a.md            # reviewer-a's review notes
   helix/critique-b.md            # reviewer-b's review notes
+  helix/ledger.jsonl             # usage against the budget (written only by the hooks)
 ```
 
 Put the skill, agents, hooks, and `settings.json` in your user directory
@@ -155,8 +232,9 @@ Put the skill, agents, hooks, and `settings.json` in your user directory
 `.claude/` to scope it to one repo. The `helix/` state directory stays **per project**
 either way — each project runs its own workflow.
 
-`helix-hash.js` is not registered as a hook, but it must sit in the same `hooks/` folder as
-the other two: both hooks load it from there, and the reviewers run it by that path.
+`helix-hash.js` and `helix-budget.js` are not registered as hooks, but they must sit in the
+same `hooks/` folder as the other two: both hooks load them from there, and the reviewers
+and the orchestrator run them by that path.
 
 ### Register the hooks
 
@@ -168,7 +246,7 @@ the `PreToolUse` and `Stop` events:
   "hooks": {
     "PreToolUse": [
       {
-        "matcher": "Write|Edit|MultiEdit|Bash|PowerShell",
+        "matcher": "Write|Edit|MultiEdit|Bash|PowerShell|Agent|Task",
         "hooks": [
           {
             "type": "command",
@@ -196,7 +274,7 @@ the `PreToolUse` and `Stop` events:
 Line by line:
 
 - The `"PreToolUse"` array holds hooks that run **before** a tool call.
-- The `"matcher"` limits the guard to the tools that could touch state: the file editors and the shells.
+- The `"matcher"` limits the guard to the tools that could touch state (the file editors and the shells) and to delegation to subagents (`Agent`, called `Task` in older versions of Claude Code), so it can refuse new review work on a spent budget.
 - The guard `"command"` runs the guard script through Node.
 - The `"Stop"` array holds hooks that run **when the agent tries to end its turn**.
 - The stop `"command"` runs the stop-gate script.
@@ -214,7 +292,7 @@ The **stop-gate** (`Stop` event):
 - Send an approval that no longer matches the code back to `pending`, with a note starting `RECHECK:`. For a checkpoint that has already passed, do this every time the hook runs when `recheck` is `"strict"`, and only at the final gate (once every checkpoint has passed) when it is `"deferred"`.
 - If every checkpoint is `passed` and every approval is fresh, set `status` to `complete` and allow the stop.
 - Otherwise **block** the stop (exit code 2) and print, to standard error, which checkpoint is next, which reviewers are still pending/rejected, which checkpoints need only a re-review, and to read both critique files. The checkpoint still being built comes before any re-review. Claude Code feeds that text back to the agent as the reason it cannot stop.
-- Keep an iteration counter and a cap, so a stuck run pauses instead of looping forever.
+- Enforce the budget (see [The budget](#the-budget-pass-limits-time-limits-and-the-diff-alarm)). Record usage in the ledger, including each blocked stop; never reset the count on `paused`. If the run is `in_progress` or `paused` and any limit is spent, set `status` to `"halted"` with a `halt_reason` and allow the stop. Include the usage against the limits in every block message.
 
 The **guard** (`PreToolUse` event) — enforced per role (the subagent's name; "main" is the builder):
 
@@ -222,6 +300,7 @@ The **guard** (`PreToolUse` event) — enforced per role (the subagent's name; "
 - **reviewer-a / reviewer-b**: each may change _only_ its own verdict slot (`reviews.reviewer_a` or `reviews.reviewer_b`) in `state.json`, and write _only_ its own findings file (`critique-a.md` or `critique-b.md`). Any attempt to touch `passed`, `status`, the other reviewer's slot, another checkpoint, or a source file is denied. A new approval is also denied unless its `files` and `hash` match the files on disk at that moment. This keeps the two reviews **independent**, un-forgeable, and tied to the code they describe.
 - **test-author**: may write _only_ test files (a file in a `tests/` directory, or `test_*.py` / `*_test.py` / `*.spec.*` / `conftest.py`). Every write under `.claude/helix/` is denied, so it can never approve anything or touch state.
 - **main (the builder)**: during the planning phase (`status` is `awaiting_approval`, or before a state file exists) it may edit the plan freely _as long as_ nothing starts out approved (all `passed` false, `review_notes` empty, both verdicts `pending`), and this is when it may set `recheck`. Once `status` is `in_progress` the plan, including `recheck`, is frozen: the only change allowed to `state.json` is the top-level `status` (to `in_progress` or `paused`). Any Write/Edit to a `critique-*.md`, or any other write under `.claude/helix/`, is denied — this is the rule that stops the builder from approving its own work or rewriting a review.
+- **Budget:** record a usage tick (at most once a minute) on any tool call, and a review round each time a reviewer records a verdict. While any limit is spent, deny delegation (`Agent`/`Task`) to the test-author and the reviewers, and deny the builder setting `status` to `in_progress` or moving it out of `halted`. Deny any change to `limits` from the builder; only the user changes them, by hand. When the planner writes a new plan, start a new ledger.
 - Deny any shell command from **any** role that touches the `.claude/helix/` directory (this also stops one reviewer from reading the other's findings via the shell).
 - The guard **fails closed**: if it hits an unexpected error it denies rather than allowing, so a bug can never silently wave a write through.
 - Allow everything else.
@@ -286,10 +365,12 @@ change the mode at this point too:
 ```
 
 The stop-gate keeps the agent working until both reviewers have approved every
-checkpoint and every approval still matches the code.
+checkpoint and every approval still matches the code, or until the budget is spent. Then
+the run halts and the orchestrator tells you which limit was reached and what is still
+open.
 
-If a run pauses (the agent needs a decision from you, or it hit the iteration cap), resume
-it with no arguments:
+If a run pauses (the agent needs a decision from you), resume it with no arguments. If it
+halted, first raise the spent limit in `.claude/helix/state.json` by hand, then resume:
 
 ```
 /orchestrator
@@ -303,8 +384,8 @@ word.
 
 These are the exact files of the working implementation. Save each one at the path shown,
 under `~/.claude/` (every project) or a project's `.claude/` (one project), then register
-the two hooks as shown in [Register the hooks](#register-the-hooks). `helix-hash.js` needs
-no registration; keep it beside the hooks.
+the two hooks as shown in [Register the hooks](#register-the-hooks). `helix-hash.js` and
+`helix-budget.js` need no registration; keep them beside the hooks.
 
 ### The `/orchestrator` skill
 
@@ -322,6 +403,8 @@ disable-model-invocation: true
 
 You are the master coordinator of the Helix workflow. State lives in `.claude/helix/state.json`; the two reviewers' findings live in `.claude/helix/critique-a.md` and `.claude/helix/critique-b.md`. A Stop hook blocks you from ending your turn while `status` is `"in_progress"` and any checkpoint is unpassed. A checkpoint's `passed` is derived by that hook and becomes true only when **both** independent reviewers approve it — you cannot set it yourself. Each approval records the files it covers and a hash of them; if any of those files changes afterwards, the hook sends that approval back to `pending` with a note starting `RECHECK:`.
 
+Every run also has a **budget** in the state file's `limits` (review rounds per checkpoint and per run, active minutes per checkpoint and per run, and a diff alarm on how many lines the run and the current checkpoint have changed), plus `max_iterations` for blocked stops. When any of it is spent, the hooks refuse new test-author and reviewer work and the Stop hook sets `status` to `"halted"`. Only the user can raise a limit, by hand; you cannot change `limits` or move a halted run back to work. Check usage at any time with `node ~/.claude/hooks/helix-budget.js`.
+
 Arguments: $ARGUMENTS
 
 ## Decide what to do
@@ -330,15 +413,15 @@ First, the recheck mode (see "Recheck mode" below): if the first word of the arg
 
 - **A feature request** → Phase 1, passing the mode to the planner.
 - **`approve`**, or the user approves the plan in conversation → Phase 2.
-- **Nothing** → read the state file and resume: `awaiting_approval` → show the plan and ask for approval; `paused` or `in_progress` → Phase 2; `complete` or missing → ask the user for a feature request.
+- **Nothing** → read the state file and resume: `awaiting_approval` → show the plan and ask for approval; `paused` or `in_progress` → Phase 2; `halted` → see "When the budget is spent"; `complete` or missing → ask the user for a feature request.
 
 A mode given while the state is `awaiting_approval` is applied in Phase 2 step 1. A mode given while the loop is `in_progress` or `paused` cannot be applied: the plan is locked. Tell the user in one line which mode the run is using and that they can change `recheck` in the state file by hand, then resume.
 
 ## Phase 1: Plan
 
-1. Delegate to the `planner` subagent with the full feature request and, if the user gave one, the recheck mode.
-2. Read `.claude/helix/state.json` and present to the user: the checkpoints as a numbered list with their acceptance criteria and `touches`, every file that more than one checkpoint touches, and the recheck mode. If several checkpoints share files, point out that `strict` will re-review those checkpoints repeatedly and `deferred` costs less.
-3. Ask the user to review, edit the file if they wish, and reply `approve` (optionally `approve strict` or `approve deferred` to change the mode). Then end your turn. (The hook allows this because status is `awaiting_approval`.)
+1. Delegate to the `planner` subagent with the full feature request and, if the user gave them, the recheck mode and any limits.
+2. Read `.claude/helix/state.json` and present to the user: the checkpoints as a numbered list with their acceptance criteria and `touches`, every file that more than one checkpoint touches, the recheck mode, and the budget (`limits` and `max_iterations`; a `null` limit is sized from the number of checkpoints, as `node ~/.claude/hooks/helix-budget.js` shows once the run starts). If several checkpoints share files, point out that `strict` will re-review those checkpoints repeatedly and `deferred` costs less.
+3. Ask the user to review, edit the file if they wish (including the limits), and reply `approve` (optionally `approve strict` or `approve deferred` to change the mode). Then end your turn. (The hook allows this because status is `awaiting_approval`.)
 
 ## Phase 2: Implement loop
 
@@ -349,13 +432,24 @@ A mode given while the state is `awaiting_approval` is applied in Phase 2 step 1
 5. **Run the tests yourself.** Run `test_command` and any commands named in the acceptance criteria. Do not ask for review until they pass; the reviewers will reject a red or missing test.
 6. **Review independently, in parallel.** Set `"status": "paused"` first (see "Waiting on subagents" below). Then, in a single message, delegate to **both** `reviewer-a` and `reviewer-b`, giving each only the checkpoint id and the **same** list of files: every file you created or changed for this checkpoint plus its `test_target`. The hook rejects approvals of differing file lists. Never pass one reviewer the other's notes, verdict, or critique file — their independence is the point. When both have returned, set `"status": "in_progress"` again before doing anything else.
 7. Read both verdicts from `state.json` (`reviews.reviewer_a` and `reviews.reviewer_b`) and both critique files. The checkpoint advances **only when the tests pass AND both reviewers have `"verdict": "approved"`.** If either reviewer rejected, go back to step 2 for the **same** checkpoint: fix the findings, re-run tests, and re-delegate to both reviewers. One approval is never enough, and an approval given before your fix no longer counts: its hash is stale.
-8. If `recheck` is `"strict"`, do the strict recheck described under "Recheck mode" now. Then move to the next unpassed checkpoint and repeat. When every checkpoint is passed (both reviewers approved each), the Stop hook marks the run complete; give the user a short summary of what was built and the reviewers' notes.
+8. If `recheck` is `"strict"`, do the strict recheck described under "Recheck mode" now. Then move to the next unpassed checkpoint and repeat. When every checkpoint is passed (both reviewers approved each), the Stop hook marks the run complete; give the user a short summary of what was built, the reviewers' notes, and the budget used (`node ~/.claude/hooks/helix-budget.js`).
 
 ## Rules
 
 - Never edit a `passed` flag, a `review_notes` field, or any `reviews.*` verdict yourself. Only the reviewers record verdicts, and only the Stop hook derives `passed` (both-approved). A PreToolUse hook enforces this: from the main session you may only change the top-level `status` (to `in_progress` or `paused`) with the Edit tool, you may not write any `critique-*.md`, and shell commands may not touch `.claude/helix/`. Read state with the Read tool.
 - Never weaken acceptance criteria, delete/skip generated tests, or edit a reviewer's findings to get an approval.
 - If you are truly blocked (missing credentials, an ambiguous requirement, a decision only the user can make), set `"status": "paused"`, explain exactly what you need, and end your turn. Do not use this to escape hard work.
+
+## When the budget is spent
+
+A hook denial that says the budget is spent, or a `"halted"` status, ends the work. Do not retry, work around it, or keep editing code to get under a limit.
+
+1. If the run is `in_progress`, set `"status": "paused"` (the Stop hook then halts it).
+2. Report to the user: which limit was spent (`halt_reason`, or the denial's text), the output of `node ~/.claude/hooks/helix-budget.js`, which checkpoints passed, and for the checkpoint that did not, the open findings from both critique files in a few lines each. If the reviewers keep rejecting for the same reason, or the diff alarm went off, say what you think is causing it (an acceptance criterion that cannot be met, reviewers who disagree, a fix that keeps growing).
+3. Offer the user the choices: raise the spent limit by hand in `state.json` and run `/orchestrator` to resume; re-plan with narrower checkpoints; or stop and keep what passed.
+4. End your turn.
+
+When the user runs `/orchestrator` on a `halted` run, set `"status": "in_progress"` and continue Phase 2. If the guard denies it, the budget is still spent: tell the user which limit and end your turn.
 
 ## Recheck mode
 
@@ -368,7 +462,7 @@ A recheck is a re-review, not a rebuild. Always finish the checkpoint you are bu
 
 ## Waiting on subagents
 
-The Stop hook counts every blocked stop toward `max_iterations`. If the run is `in_progress` while a subagent works and you end your turn to wait for it, each wait burns an iteration, and the cap can run out before the work is done. So:
+The Stop hook counts every blocked stop toward `max_iterations`, for the whole run (pausing does not reset the count). If the run is `in_progress` while a subagent works and you end your turn to wait for it, each wait burns an iteration, and the cap can run out before the work is done. So:
 
 - Set `"status": "paused"` immediately before delegating to the `test-author` or the reviewers.
 - Set `"status": "in_progress"` immediately after they return, before reading results or making any other change.
@@ -410,6 +504,14 @@ You are a task-planning sub-agent. You do not write feature code.
   "status": "awaiting_approval",
   "max_iterations": 25,
   "recheck": "deferred",
+  "limits": {
+    "max_review_rounds": 4,
+    "max_total_review_rounds": null,
+    "max_active_minutes": 240,
+    "max_checkpoint_minutes": 60,
+    "max_diff_lines": null,
+    "max_checkpoint_diff_lines": 800
+  },
   "test_command": "<command that runs the project's tests, or null>",
   "checkpoints": [
     {
@@ -435,6 +537,7 @@ You are a task-planning sub-agent. You do not write feature code.
 ## Rules
 
 - Set `recheck` to the mode the orchestrator gives you (`"strict"` or `"deferred"`); if it gives none, use `"deferred"`. It controls when earlier checkpoints are re-reviewed after their files change; the user may switch it before approving.
+- Write `limits` as shown, replacing any value the orchestrator gives you. Each is a positive integer or `null` (`null` sizes it from the number of checkpoints). Size the checkpoints to fit: one checkpoint should not need more than about `max_checkpoint_diff_lines` changed lines or `max_checkpoint_minutes` of work; split it if it would.
 - `status` must be `"awaiting_approval"`. Never set it to anything else; the orchestrator does that after the user approves.
 - Every checkpoint starts with `"passed": false`, empty `review_notes`, and both reviewer verdicts `"pending"`. The Helix guard will reject a plan where anything starts out approved.
 - Do not modify any file outside `.claude/helix/`.
@@ -714,6 +817,11 @@ a checkpoint passes only when reviewer-a AND reviewer-b have both approved.
 // which does not pass through this hook.
 //
 // No shell command from any role may touch .claude/helix/.
+//
+// Budget (helix-budget.js): this hook also records usage in the hooks' ledger (a tick on
+// tool activity, each reviewer verdict as a review round), and refuses to go past a spent
+// budget: no delegation to the test-author or a reviewer, and no move back to
+// "in_progress", while any limit is spent. Only the user may change "limits" (by hand).
 
 const fs = require("fs");
 const path = require("path");
@@ -727,6 +835,8 @@ const VERDICTS = new Set(["pending", "approved", "rejected"]);
 const SLOT_KEYS = new Set(["verdict", "tests_verified", "notes", "files", "hash"]);
 const RECHECK_MODES = new Set(["deferred", "strict"]);
 const { slotProblem } = require("./helix-hash.js");
+const budget = require("./helix-budget.js");
+const BUDGETED_AGENTS = new Set(["test-author", "reviewer-a", "reviewer-b"]);
 
 function allow() {
   process.exit(0);
@@ -770,6 +880,34 @@ const helixFile = (name) => path.join(helixDir, name).toLowerCase();
 
 const tool = input.tool_name;
 const ti = input.tool_input || {};
+
+function readState() {
+  try {
+    return JSON.parse(fs.readFileSync(statePath, "utf8"));
+  } catch {
+    return undefined;
+  }
+}
+
+// Usage bookkeeping never blocks a tool call (tick() never throws).
+if (budget.tickDue(projectDir)) budget.tick(projectDir, readState());
+
+// --- Delegation: no new test or review work on a spent budget. --------------------------
+if (tool === "Agent" || tool === "Task") {
+  if (!BUDGETED_AGENTS.has(ti.subagent_type)) allow();
+  const state = readState();
+  if (!state) allow();
+  if (state.status === "halted") {
+    deny(`the run is halted (${state.halt_reason || "budget spent"}). Do not delegate more work. Report the halt to the user and end your turn. ${budget.HALT_HELP}`);
+  }
+  if (budget.ACTIVE.has(state.status)) {
+    const { problems } = budget.evaluate(projectDir, state);
+    if (problems.length) {
+      deny(`the run's budget is spent: ${problems.join("; ")}. Do not delegate more work. Set "status" to "paused", report this to the user, and end your turn; the stop-gate will halt the run. ${budget.HALT_HELP}`);
+    }
+  }
+  allow();
+}
 
 // --- Shell: nobody may touch .claude/helix/ from a shell. ------------------------------
 if (tool === "Bash" || tool === "PowerShell") {
@@ -827,6 +965,7 @@ if (REVIEWERS[role]) {
   if (after === undefined) allow(); // the tool call would fail on its own; let it.
   const problem = onlyReviewerSlotChanged(before, after, slot);
   if (problem) deny(problem);
+  recordVerdicts(before, after, slot);
   allow();
 }
 
@@ -841,8 +980,9 @@ if (role === "planner") {
   if (after.status !== "awaiting_approval") {
     deny('the planner must leave status as "awaiting_approval"; the orchestrator starts the loop after you approve.');
   }
-  const bad = notAllUnapproved(after) || badRecheck(after);
+  const bad = notAllUnapproved(after) || badRecheck(after) || budget.badLimits(after);
   if (bad) deny(bad);
+  budget.resetLedger(projectDir); // a new plan is a new run with a fresh budget
   allow();
 }
 
@@ -857,16 +997,34 @@ if (target !== statePath.toLowerCase()) {
 const { before, after } = computeStateChange();
 if (after === undefined) allow();
 
+if (before && before.status === "halted" && after.status !== "halted") {
+  const { problems } = budget.evaluate(projectDir, after);
+  if (problems.length) {
+    deny(`the run is halted and its budget is still spent: ${problems.join("; ")}. Only the user can resume it. ${budget.HALT_HELP}`);
+  }
+}
+
+if (before && !deepEqual(before.limits, after.limits)) {
+  deny('only the user may change "limits", by editing state.json by hand.');
+}
+
 if (!MAIN_STATUSES.has(after.status)) {
   deny(
     `status may only be set to ${[...MAIN_STATUSES].join(", ")}. The Stop hook marks the workflow complete.`
   );
 }
 
+if (after.status === "in_progress" && (!before || before.status !== "in_progress")) {
+  const { problems } = budget.evaluate(projectDir, after);
+  if (problems.length) {
+    deny(`the run's budget is spent: ${problems.join("; ")}. Leave it paused, report this to the user, and end your turn. ${budget.HALT_HELP}`);
+  }
+}
+
 if (!before || before.status === "awaiting_approval") {
   // Planning phase: the builder may edit the plan and flip status to in_progress, as long
   // as nothing starts out approved. This is also where "recheck" may be chosen.
-  const bad = notAllUnapproved(after) || badRecheck(after);
+  const bad = notAllUnapproved(after) || badRecheck(after) || budget.badLimits(after);
   if (bad) deny(bad);
   allow();
 }
@@ -883,6 +1041,18 @@ allow();
 // ======================================================================================
 // helpers
 // ======================================================================================
+
+// Each verdict a reviewer records (approved or rejected) is one review by that reviewer.
+function recordVerdicts(before, after, slot) {
+  const ba = cps(before);
+  cps(after).forEach((c, i) => {
+    const prev = ((ba[i] || {}).reviews || {})[slot] || {};
+    const s = (c.reviews || {})[slot] || {};
+    if (s.verdict !== "pending" && !deepEqual(prev, s)) {
+      budget.record(projectDir, { ev: "verdict", cp: c.id, slot, verdict: s.verdict });
+    }
+  });
+}
 
 function isTestFile(p) {
   const b = path.basename(p);
@@ -1044,15 +1214,19 @@ function onlyReviewerSlotChanged(before, after, slot) {
 // In both modes a checkpoint cannot newly pass on a stale approval, and the run cannot
 // complete while any approval is stale.
 //
+// The run also has a budget (helix-budget.js): review rounds, active time, a diff alarm,
+// and a cap on blocked stops. When any of it is spent, this hook sets status to "halted"
+// and lets Claude stop, so the run goes back to the user instead of looping. The count of
+// blocked stops lives in the hooks' ledger, so pausing to wait for subagents does not
+// reset it.
+//
 // Exit 0 -> Claude may stop.
 // Exit 2 -> Claude is blocked; stderr is fed back to it as the reason.
 
 const fs = require("fs");
 const path = require("path");
-const { SLOTS, checkCheckpoint } = require("./helix-hash.js");
-
-// Prefix this hook puts in a reviewer's notes when it sends an approval back to pending.
-const RECHECK = "RECHECK:";
+const { checkCheckpoint } = require("./helix-hash.js");
+const { RECHECK, isRecheck, tick, evaluate, summary, record, HALT_HELP } = require("./helix-budget.js");
 
 const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
 const helixDir = path.join(projectDir, ".claude", "helix");
@@ -1084,12 +1258,6 @@ function resetCounter() {
   } catch {}
 }
 
-// True if this hook sent one of the checkpoint's approvals back for a re-review.
-function isRecheck(cp) {
-  const r = cp.reviews || {};
-  return SLOTS.some((s) => String((r[s] && r[s].notes) || "").startsWith(RECHECK));
-}
-
 function reviewerState(cp) {
   const r = cp.reviews || {};
   const v = (s) => (r[s] && r[s].verdict) || "pending";
@@ -1112,12 +1280,34 @@ try {
   block(`Helix gate: .claude/helix/state.json is not valid JSON (${err.message}). Repair it without changing any verdicts or "passed" values, then continue.`);
 }
 
-// Only enforce while the loop is actively running. Planning/approval and paused/complete
-// states must let Claude hand control back to the user.
-if (state.status !== "in_progress") {
-  resetCounter();
+function writeState() {
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
+}
+
+// Spent budget: halt the run and hand it to the user. Only the user can resume it, by
+// raising the spent limit by hand; the guard keeps the agent from doing either.
+function halt(result) {
+  state.status = "halted";
+  state.halt_reason = result.problems.join("; ");
+  writeState();
+  record(projectDir, { ev: "halt", reason: state.halt_reason });
+  allow(
+    `Helix HALTED: ${state.halt_reason}. ${summary(result, state)} ${HALT_HELP}`
+  );
+}
+
+resetCounter(); // the state file parsed; the corrupt-state counter starts over
+tick(projectDir, state);
+
+// Only enforce while the loop is actively running. Planning/approval, halted and complete
+// states must let Claude hand control back to the user. A paused run may stop, but if its
+// budget is spent it is halted first, so it cannot be resumed past its limits.
+if (state.status === "paused") {
+  const result = evaluate(projectDir, state);
+  if (result.problems.length) halt(result);
   allow();
 }
+if (state.status !== "in_progress") allow();
 
 const checkpoints = Array.isArray(state.checkpoints) ? state.checkpoints : [];
 
@@ -1164,22 +1354,24 @@ if (pending.length === 0 && !strict) pending = derive(true);
 
 if (checkpoints.length > 0 && pending.length === 0) {
   state.status = "complete";
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
-  resetCounter();
+  delete state.halt_reason;
+  writeState();
+  record(projectDir, { ev: "complete" });
   allow("Helix: every checkpoint approved by BOTH reviewers. Workflow complete.");
 }
 
-if (dirty) fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
+const result = evaluate(projectDir, state);
+if (result.problems.length) halt(result);
 
-const max = Number.isInteger(state.max_iterations) ? state.max_iterations : DEFAULT_MAX_ITERATIONS;
-const n = readCounter() + 1;
-if (n > max) {
-  state.status = "paused";
-  fs.writeFileSync(statePath, JSON.stringify(state, null, 2) + "\n");
-  resetCounter();
-  allow(`Helix: hit the ${max}-iteration cap with ${pending.length} checkpoint(s) not passed. Loop paused; run /orchestrator to resume.`);
+if (state.halt_reason !== undefined) {
+  delete state.halt_reason; // resumed after the user raised the limit
+  dirty = true;
 }
-fs.writeFileSync(counterPath, String(n));
+if (dirty) writeState();
+
+record(projectDir, { ev: "block" });
+const n = result.usage.blocks + 1;
+const max = result.limits.max_iterations;
 
 // Finish the checkpoint being built before re-reviewing the ones this hook reopened.
 const next = pending.find((c) => !isRecheck(c)) || pending[0] || {};
@@ -1196,6 +1388,7 @@ const lines = [
     : "Read .claude/helix/critique-a.md and .claude/helix/critique-b.md for the latest findings, fix every one, re-run the tests, then delegate to reviewer-a AND reviewer-b again.",
   'Do not edit "passed" flags or reviewer verdicts yourself; only the reviewers record verdicts and only this gate derives "passed".',
   'If you are genuinely blocked and need the user, set "status" to "paused" in .claude/helix/state.json and explain why.',
+  summary(result, state) + " When any limit is spent the run halts and goes to the user.",
 ];
 block(lines.filter(Boolean).join("\n"));
 ```
@@ -1329,6 +1522,392 @@ if (require.main === module) {
     }
     console.log(JSON.stringify({ files, hash: hashFiles(projectDir, files) }));
   }
+}
+```
+
+### The budget (shared by both hooks)
+
+`.claude/hooks/helix-budget.js`
+
+```js
+#!/usr/bin/env node
+// Helix Budget: the limits that stop a run from looping forever.
+//
+// Every run has a budget in state.json "limits" (defaults below). When any part of it is
+// spent, the hooks halt the run (status "halted") and hand it to the user:
+//   max_review_rounds          review rounds per checkpoint, re-reviews (RECHECK) included
+//   max_total_review_rounds    review rounds for the whole run (null: 3 per checkpoint, min 6)
+//   max_active_minutes         active time for the whole run
+//   max_checkpoint_minutes     active time on the checkpoint currently being worked on
+//   max_diff_lines             diff alarm: lines changed since the run started
+//                              (null: 500 per checkpoint, min 1000)
+//   max_checkpoint_diff_lines  diff alarm: growth of the diff while one checkpoint is current
+// plus the top-level "max_iterations": blocked stops for the whole run.
+//
+// Usage is read from an append-only ledger, .claude/helix/ledger.jsonl, that only the hooks
+// write (the guard denies every tool write under .claude/helix/ that is not a role's own
+// file, and every shell command that touches it). It never resets on "paused", so pausing
+// to wait for subagents cannot reset any count.
+//
+// Active time: the hooks record a tick at most once a minute while a run is in_progress or
+// paused. A gap of more than 10 minutes between two events is idle time (for example, a
+// run waiting on you overnight) and is not counted.
+//
+// Diff size: lines added + deleted versus the commit the run started on (`git diff
+// --numstat`), plus the lines of new untracked files, excluding .claude/. Outside a git
+// repository the diff alarm is off.
+//
+// CLI (project root = CLAUDE_PROJECT_DIR or the current directory):
+//   node helix-budget.js        print the run's usage against its limits
+
+const fs = require("fs");
+const path = require("path");
+const { execFileSync } = require("child_process");
+
+const DEFAULTS = {
+  max_review_rounds: 4,
+  max_total_review_rounds: null,
+  max_active_minutes: 240,
+  max_checkpoint_minutes: 60,
+  max_diff_lines: null,
+  max_checkpoint_diff_lines: 800,
+};
+const DEFAULT_MAX_ITERATIONS = 25;
+const ACTIVE = new Set(["in_progress", "paused"]);
+const TICK_MS = 60 * 1000;
+const IDLE_GAP_MS = 10 * 60 * 1000;
+const EMPTY_TREE = "4b825dc642cb6eb9a060e54bf8d69288fbee4904";
+// Prefix the Stop hook puts in a reviewer's notes when it sends an approval back to pending.
+const RECHECK = "RECHECK:";
+
+const helixDir = (projectDir) => path.join(projectDir, ".claude", "helix");
+const ledgerPath = (projectDir) => path.join(helixDir(projectDir), "ledger.jsonl");
+
+function cps(state) {
+  return state && Array.isArray(state.checkpoints) ? state.checkpoints : [];
+}
+
+// Returns a problem string if state.limits is malformed, else "".
+function badLimits(state) {
+  const l = state.limits;
+  if (l === undefined) return "";
+  if (!l || typeof l !== "object" || Array.isArray(l)) return '"limits" must be an object.';
+  for (const [k, v] of Object.entries(l)) {
+    if (!Object.prototype.hasOwnProperty.call(DEFAULTS, k)) {
+      return `unknown limit "${k}"; the limits are: ${Object.keys(DEFAULTS).join(", ")}.`;
+    }
+    if (v !== null && !(Number.isInteger(v) && v > 0)) return `limits.${k} must be a positive integer or null.`;
+  }
+  return "";
+}
+
+function limitsFor(state) {
+  const n = cps(state).length || 1;
+  const l = { ...DEFAULTS };
+  for (const [k, v] of Object.entries((state && state.limits) || {})) {
+    if (Object.prototype.hasOwnProperty.call(DEFAULTS, k) && v !== undefined) l[k] = v;
+  }
+  if (l.max_total_review_rounds == null) l.max_total_review_rounds = Math.max(6, 3 * n);
+  if (l.max_diff_lines == null) l.max_diff_lines = Math.max(1000, 500 * n);
+  if (l.max_review_rounds == null) l.max_review_rounds = DEFAULTS.max_review_rounds;
+  if (l.max_active_minutes == null) l.max_active_minutes = DEFAULTS.max_active_minutes;
+  if (l.max_checkpoint_minutes == null) l.max_checkpoint_minutes = DEFAULTS.max_checkpoint_minutes;
+  if (l.max_checkpoint_diff_lines == null) l.max_checkpoint_diff_lines = DEFAULTS.max_checkpoint_diff_lines;
+  l.max_iterations = Number.isInteger(state && state.max_iterations) ? state.max_iterations : DEFAULT_MAX_ITERATIONS;
+  return l;
+}
+
+function isRecheck(cp) {
+  const r = cp.reviews || {};
+  return ["reviewer_a", "reviewer_b"].some((s) => String((r[s] && r[s].notes) || "").startsWith(RECHECK));
+}
+
+// The checkpoint being worked on: the first unpassed one that is not only waiting for a
+// re-review (the orchestrator finishes that one first), else the first unpassed one.
+function currentCheckpoint(state) {
+  const pending = cps(state).filter((c) => c.passed !== true);
+  return pending.find((c) => !isRecheck(c)) || pending[0] || null;
+}
+
+// ---- ledger ---------------------------------------------------------------------------
+
+// The events of the current run: everything from the last "start" on.
+function readEvents(projectDir) {
+  let text;
+  try {
+    text = fs.readFileSync(ledgerPath(projectDir), "utf8");
+  } catch {
+    return [];
+  }
+  const events = [];
+  for (const line of text.split("\n")) {
+    if (!line.trim()) continue;
+    try {
+      const e = JSON.parse(line);
+      if (e && typeof e.t === "number" && typeof e.ev === "string") events.push(e);
+    } catch {}
+  }
+  let start = -1;
+  for (let i = 0; i < events.length; i++) if (events[i].ev === "start") start = i;
+  return start < 0 ? [] : events.slice(start);
+}
+
+function record(projectDir, ev) {
+  fs.mkdirSync(helixDir(projectDir), { recursive: true });
+  fs.appendFileSync(ledgerPath(projectDir), JSON.stringify({ t: Date.now(), ...ev }) + "\n");
+}
+
+// A new plan starts a new run: keep the previous ledger as ledger.prev.jsonl.
+function resetLedger(projectDir) {
+  const p = ledgerPath(projectDir);
+  if (!fs.existsSync(p)) return;
+  fs.renameSync(p, path.join(helixDir(projectDir), "ledger.prev.jsonl"));
+}
+
+// ---- diff -----------------------------------------------------------------------------
+
+function git(projectDir, args) {
+  return execFileSync("git", args, {
+    cwd: projectDir,
+    encoding: "utf8",
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: 5000,
+    maxBuffer: 64 * 1024 * 1024,
+  });
+}
+
+function headCommit(projectDir) {
+  try {
+    git(projectDir, ["rev-parse", "--is-inside-work-tree"]);
+  } catch {
+    return null; // not a git repository: the diff alarm is off
+  }
+  try {
+    return git(projectDir, ["rev-parse", "HEAD"]).trim();
+  } catch {
+    return EMPTY_TREE; // a repository with no commits yet
+  }
+}
+
+// Lines changed since `base`, or null if it cannot be measured.
+function measureDiff(projectDir, base) {
+  if (!base) return null;
+  try {
+    let lines = 0;
+    const spec = ["--", ".", ":(exclude).claude"];
+    for (const row of git(projectDir, ["diff", "--numstat", base, ...spec]).split("\n")) {
+      const [add, del] = row.split("\t");
+      if (/^\d+$/.test(add)) lines += Number(add);
+      if (/^\d+$/.test(del)) lines += Number(del);
+    }
+    const untracked = git(projectDir, ["ls-files", "--others", "--exclude-standard", "-z", ...spec]);
+    for (const f of untracked.split("\0").filter(Boolean)) {
+      try {
+        const buf = fs.readFileSync(path.join(projectDir, f));
+        if (buf.length > 2 * 1024 * 1024 || buf.subarray(0, 8000).includes(0)) continue; // binary or huge
+        const text = buf.toString("utf8");
+        lines += text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+      } catch {}
+    }
+    return lines;
+  } catch {
+    return null;
+  }
+}
+
+// ---- recording usage ------------------------------------------------------------------
+
+// Called by both hooks on every invocation. Starts the run's ledger, notes when the current
+// checkpoint changes (with the diff size at that moment, the base for the checkpoint's diff
+// alarm), and records a tick at most once a minute. Never throws.
+function tick(projectDir, state) {
+  try {
+    if (!state || !ACTIVE.has(state.status)) return;
+    let events = readEvents(projectDir);
+    if (events.length === 0) {
+      const base = headCommit(projectDir);
+      record(projectDir, { ev: "start", base, diff: measureDiff(projectDir, base) });
+      events = readEvents(projectDir);
+    }
+    const cur = currentCheckpoint(state);
+    const id = cur ? cur.id : null;
+    const lastCp = [...events].reverse().find((e) => e.ev === "cp");
+    if (!lastCp || lastCp.cp !== id) {
+      record(projectDir, { ev: "cp", cp: id, diff: measureDiff(projectDir, events[0].base) });
+      return;
+    }
+    if (Date.now() - events[events.length - 1].t >= TICK_MS) record(projectDir, { ev: "tick", cp: id });
+  } catch {}
+}
+
+// Cheap pre-check for the guard, which runs on every tool call: skip the tick if the ledger
+// was written less than a minute ago.
+function tickDue(projectDir) {
+  try {
+    return Date.now() - fs.statSync(ledgerPath(projectDir)).mtimeMs >= TICK_MS;
+  } catch {
+    return true;
+  }
+}
+
+// ---- evaluating the budget ------------------------------------------------------------
+
+function usage(projectDir, state, { diff = true } = {}) {
+  const events = readEvents(projectDir);
+  const now = Date.now();
+  const u = {
+    started: events.length > 0,
+    activeMs: 0,
+    cpActiveMs: {},
+    rounds: {},
+    totalRounds: 0,
+    blocks: 0,
+    diff: null,
+    cpDiff: null,
+  };
+  if (!u.started) return u;
+
+  // Active time: sum the gaps between events (and up to now), skipping idle gaps. Each gap
+  // is charged to the checkpoint that was current when it began.
+  let cpNow = null;
+  const counts = {};
+  for (let i = 0; i <= events.length; i++) {
+    const t = i < events.length ? events[i].t : now;
+    if (i > 0) {
+      const gap = t - events[i - 1].t;
+      if (gap > 0 && gap <= IDLE_GAP_MS) {
+        u.activeMs += gap;
+        if (cpNow !== null) u.cpActiveMs[cpNow] = (u.cpActiveMs[cpNow] || 0) + gap;
+      }
+    }
+    if (i === events.length) break;
+    const e = events[i];
+    if (e.ev === "cp") cpNow = e.cp;
+    if (e.ev === "block") u.blocks++;
+    if (e.ev === "verdict") {
+      counts[e.cp] = counts[e.cp] || {};
+      counts[e.cp][e.slot] = (counts[e.cp][e.slot] || 0) + 1;
+    }
+  }
+  // A round is one review by each reviewer; count the busier reviewer.
+  for (const [cp, c] of Object.entries(counts)) {
+    u.rounds[cp] = Math.max(...Object.values(c));
+    u.totalRounds += u.rounds[cp];
+  }
+
+  if (diff) {
+    const start = events[0];
+    const lines = measureDiff(projectDir, start.base);
+    if (lines !== null) {
+      u.diff = Math.max(0, lines - (start.diff || 0));
+      const lastCp = [...events].reverse().find((e) => e.ev === "cp");
+      if (lastCp && typeof lastCp.diff === "number") u.cpDiff = Math.max(0, lines - lastCp.diff);
+    }
+  }
+  return u;
+}
+
+const minutes = (ms) => Math.floor(ms / 60000);
+
+// Returns { limits, usage, problems }. problems lists every limit that is spent; while the
+// run is not complete, any problem halts it.
+function evaluate(projectDir, state, opts) {
+  const l = limitsFor(state);
+  const u = usage(projectDir, state, opts);
+  const problems = [];
+  if (!u.started) return { limits: l, usage: u, problems };
+
+  for (const cp of cps(state)) {
+    const r = u.rounds[cp.id] || 0;
+    if (cp.passed !== true && r >= l.max_review_rounds) {
+      problems.push(
+        `checkpoint ${cp.id} has used ${r} of ${l.max_review_rounds} review rounds (limits.max_review_rounds) without passing`
+      );
+    }
+  }
+  if (u.totalRounds >= l.max_total_review_rounds) {
+    problems.push(
+      `the run has used ${u.totalRounds} of ${l.max_total_review_rounds} review rounds (limits.max_total_review_rounds)`
+    );
+  }
+  if (u.activeMs >= l.max_active_minutes * 60000) {
+    problems.push(
+      `the run has been active for ${minutes(u.activeMs)} of ${l.max_active_minutes} minutes (limits.max_active_minutes)`
+    );
+  }
+  const cur = currentCheckpoint(state);
+  if (cur && (u.cpActiveMs[cur.id] || 0) >= l.max_checkpoint_minutes * 60000) {
+    problems.push(
+      `checkpoint ${cur.id} has been active for ${minutes(u.cpActiveMs[cur.id])} of ${l.max_checkpoint_minutes} minutes (limits.max_checkpoint_minutes)`
+    );
+  }
+  if (u.diff !== null && u.diff > l.max_diff_lines) {
+    problems.push(
+      `DIFF ALARM: ${u.diff} lines changed since the run started, over the ${l.max_diff_lines}-line budget (limits.max_diff_lines)`
+    );
+  }
+  if (cur && u.cpDiff !== null && u.cpDiff > l.max_checkpoint_diff_lines) {
+    problems.push(
+      `DIFF ALARM: the diff grew by ${u.cpDiff} lines while checkpoint ${cur.id} was current, over the ${l.max_checkpoint_diff_lines}-line budget (limits.max_checkpoint_diff_lines)`
+    );
+  }
+  if (u.blocks >= l.max_iterations) {
+    problems.push(`the stop-gate has blocked ${u.blocks} of ${l.max_iterations} times (max_iterations)`);
+  }
+  return { limits: l, usage: u, problems };
+}
+
+// One line of usage against limits, for the stop-gate's messages.
+function summary({ limits: l, usage: u }, state) {
+  const cur = currentCheckpoint(state);
+  const parts = [];
+  if (cur) {
+    parts.push(`checkpoint ${cur.id}: ${u.rounds[cur.id] || 0}/${l.max_review_rounds} rounds, ${minutes(u.cpActiveMs[cur.id] || 0)}/${l.max_checkpoint_minutes} min`);
+    if (u.cpDiff !== null) parts.push(`checkpoint diff ${u.cpDiff}/${l.max_checkpoint_diff_lines} lines`);
+  }
+  parts.push(`run: ${u.totalRounds}/${l.max_total_review_rounds} rounds, ${minutes(u.activeMs)}/${l.max_active_minutes} min, ${u.blocks}/${l.max_iterations} blocked stops`);
+  if (u.diff !== null) parts.push(`run diff ${u.diff}/${l.max_diff_lines} lines`);
+  return `Budget: ${parts.join("; ")}.`;
+}
+
+const HALT_HELP =
+  'To continue, raise the limit in the "limits" object of .claude/helix/state.json by hand (or "max_iterations" for blocked stops) and run /orchestrator. ' +
+  "Or narrow the plan, or stop here: the agent cannot raise its own limits.";
+
+module.exports = {
+  DEFAULTS,
+  ACTIVE,
+  RECHECK,
+  badLimits,
+  limitsFor,
+  isRecheck,
+  currentCheckpoint,
+  readEvents,
+  record,
+  resetLedger,
+  tick,
+  tickDue,
+  usage,
+  evaluate,
+  summary,
+  HALT_HELP,
+};
+
+if (require.main === module) {
+  const projectDir = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  const state = JSON.parse(fs.readFileSync(path.join(helixDir(projectDir), "state.json"), "utf8"));
+  const result = evaluate(projectDir, state);
+  console.log(`status: ${state.status}${state.halt_reason ? ` (${state.halt_reason})` : ""}`);
+  if (!result.usage.started) {
+    console.log("no usage recorded yet (the run has not started)");
+  } else {
+    console.log(summary(result, state));
+    for (const cp of cps(state)) {
+      const m = minutes(result.usage.cpActiveMs[cp.id] || 0);
+      console.log(`checkpoint ${cp.id}: ${cp.passed ? "passed" : "not passed"}, ${result.usage.rounds[cp.id] || 0} review rounds, ${m} active min`);
+    }
+  }
+  console.log(result.problems.length ? `OVER BUDGET:\n- ${result.problems.join("\n- ")}` : "within budget");
 }
 ```
 

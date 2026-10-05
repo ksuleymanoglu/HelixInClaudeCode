@@ -24,6 +24,7 @@ This version is an independent implementation for everyday coding.
 - **Four helper agents.** A planner, a test writer and two reviewers. Each starts fresh with its own context, and the reviewers never see each other's notes.
 - **The guard** (a PreToolUse hook). It checks every file change before it happens. The builder can't write a verdict. Each reviewer can write only its own. The test writer can write only tests.
 - **The gate** (a Stop hook). It stops the builder from ending its turn while any checkpoint is unapproved. It's also the only thing that can mark a checkpoint "passed", and it does so only when both reviewers have said yes.
+- **The budget.** Every run has limits on review rounds, active time, and diff size. When any is spent (a checkpoint the reviewers keep rejecting, a run that goes on for hours, or a diff that suddenly grows), the run halts and comes back to you. The agent can't raise its own limits.
 
 Full details, including the hook contracts and the settings.json registration, are in [HELIX_SETUP.md](HELIX_SETUP.md).
 
